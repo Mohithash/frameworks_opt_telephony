@@ -35,8 +35,12 @@ import android.os.Bundle;
 import android.os.ParcelableException;
 import android.os.RemoteException;
 import android.os.ResultReceiver;
+import android.os.ServiceManager;
 import android.os.SystemProperties;
 import android.os.TelephonyServiceManager.ServiceRegisterer;
+import android.privacykit.IPrivacyKitManager;
+import android.privacykit.PrivacyKitIdentifierGenerator;
+import android.privacykit.PrivacyKitKeys;
 import android.telephony.ImsiEncryptionInfo;
 import android.telephony.PhoneNumberUtils;
 import android.telephony.SubscriptionManager;
@@ -111,6 +115,283 @@ public class PhoneSubInfoController extends IPhoneSubInfo.Stub {
                 "ro.vendor.api_level", Build.VERSION.DEVICE_INITIAL_SDK_INT);
     }
 
+    /**
+     * PrivacyKit-Native resolver bridge: ask the {@code privacykit} service to resolve
+     * {@code realValue} for {@code callingPackage}, returning {@code realValue} unchanged on any
+     * missing package, value, service or error.
+     *
+     * <p>ROUTE: frameworks/opt/telephony runs in the {@code com.android.phone} process, NOT in
+     * system_server, so {@code LocalServices.getService(PrivacyKitManagerInternal.class)} - the
+     * route {@code DeviceIdentifiersPolicyService} uses - is unreachable here: LocalServices is
+     * process-local to system_server and would always answer null. The published binder
+     * ({@code IPrivacyKitManager} via {@code ServiceManager.getService("privacykit")}) is the
+     * only route, the same one SettingsProvider takes.
+     *
+     * <p>A telephony hook site must always fail open and never throw.
+     */
+    private static String resolveTelephony(String callingPackage, String key, String realValue) {
+        if (callingPackage == null || realValue == null) {
+            return realValue;
+        }
+        try {
+            IPrivacyKitManager pk = IPrivacyKitManager.Stub.asInterface(
+                    ServiceManager.getService("privacykit"));
+            if (pk == null) {
+                return realValue;
+            }
+            final String resolved = pk.resolveIdentifier(callingPackage, key, realValue);
+            if (resolved == null || resolved.equals(realValue)) {
+                return realValue; // no rule - nothing to second-guess, and no extra call
+            }
+            // A substitution really did happen, so it is worth one more question:
+            // was it a RULE_PER_LAUNCH one? See pkStablePerLaunchSubstitute for
+            // why that rule type cannot be honoured on this path and what is
+            // handed back instead.
+            if (pkIsPerLaunch(pk, callingPackage, key)) {
+                return pkStablePerLaunchSubstitute(callingPackage, key, realValue);
+            }
+            return resolved;
+        } catch (Throwable t) {
+            return realValue;
+        }
+    }
+
+    /**
+     * PrivacyKitRuleResolver RULE_PER_LAUNCH, mirrored as a literal: that class
+     * lives in services.jar, which is not on this process classpath.
+     */
+    private static final int PK_RULE_PER_LAUNCH = 2;
+
+    /**
+     * Whether (callingPackage, key) is configured RULE_PER_LAUNCH.
+     *
+     * <p>Answers false on any failure - missing permission, service gone - so
+     * that "cannot tell" falls back to the value the service already resolved.
+     * Answering true on a failure would silently replace every rule type on this
+     * key with a locally minted value.
+     */
+    private static boolean pkIsPerLaunch(IPrivacyKitManager pk, String callingPackage,
+            String key) {
+        try {
+            return pk.getRuleType(callingPackage, key) == PK_RULE_PER_LAUNCH;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /**
+     * PrivacyKit-Native: RULE_PER_LAUNCH cannot mean what it says on a telephony
+     * key, so this path refuses it rather than pretending it works.
+     *
+     * <p>Per-launch is implemented by seeding the substitute with a token that
+     * is stable for the lifetime of the READING app process and changes when
+     * that app is relaunched; PrivacyKitService derives it from
+     * Binder.getCallingPid() plus that pid start time in /proc. That is right
+     * when the app itself calls resolveIdentifier - the SSAID path and the
+     * ActivityThread Build.* injector do exactly that. It is wrong here. These
+     * hooks run inside com.android.phone and resolve on behalf of the app, so
+     * the pid PrivacyKitService sees is the PHONE process. The token therefore
+     * does not change when the app relaunches, and does change when the phone
+     * process restarts - an event the user cannot see and that has nothing to do
+     * with the app. That is not per-launch by any reading of the words.
+     *
+     * <p>Deriving the token from the real caller is not reachable from here: the
+     * pid would have to be a parameter of IPrivacyKitManager.resolveIdentifier,
+     * and this module cannot add one without renumbering that interface.
+     *
+     * <p>So the substitute is minted locally from exactly the seed
+     * PrivacyKitRuleResolver itself uses when it cannot identify the caller
+     * (launchToken == 0, which it documents as degrading to "stable per
+     * (package, key)"). What the user asked for - a fake identifier - is still
+     * delivered; refusing all the way back to the real IMEI is the one outcome
+     * nobody who selected Per-launch wants. It is simply stable per app and per
+     * key instead of rotating. Every other rule type is untouched.
+     */
+    private static String pkStablePerLaunchSubstitute(String callingPackage, String key,
+            String realValue) {
+        if (!PrivacyKitIdentifierGenerator.hasGeneratorFor(key)
+                || PrivacyKitIdentifierGenerator.needsRealValue(key)) {
+            // No dedicated generator for this key, so the generic fallback is an
+            // opaque hex string - not a plausible MEID, operator name or country
+            // code. Keep the real value.
+            return realValue;
+        }
+        return PrivacyKitIdentifierGenerator.generate(key,
+                pkStableLaunchSeed(callingPackage, key), realValue);
+    }
+
+    /**
+     * The seed PrivacyKitRuleResolver would use for RULE_PER_LAUNCH with a
+     * launch token of 0. Kept identical to its private seed() - same prime, same
+     * 31x accumulation, same "package|material" shape - so the value minted here
+     * is the value the service itself would mint for a caller it cannot
+     * identify.
+     */
+    private static long pkStableLaunchSeed(String callingPackage, String key) {
+        final String combined = callingPackage + "|" + key + ":launch:0";
+        long h = 1125899906842597L;
+        for (int i = 0; i < combined.length(); i++) {
+            h = 31 * h + combined.charAt(i);
+        }
+        return h;
+    }
+
+    /**
+     * PrivacyKit-Native: {@link #resolveTelephony} plus the platform system-caller guard.
+     *
+     * <p>{@code callingUid} MUST be captured with {@link Binder#getCallingUid()} at the binder
+     * entry point, BEFORE the {@code callPhoneMethodFor*} helpers clear the calling identity.
+     * Read from inside one of their lambdas it would be the phone process itself, and every app
+     * would look like a system caller.
+     *
+     * <p>Callers below {@link android.os.Process#FIRST_APPLICATION_UID} (system_server,
+     * com.android.phone, the radio) read these same identifiers to drive carrier config, SIM
+     * provisioning and the SIM UI, so they always get the real value.
+     */
+    private static String resolveTelephonyForApp(int callingUid, String callingPackage,
+            String key, String realValue) {
+        if (callingUid < android.os.Process.FIRST_APPLICATION_UID) {
+            return realValue;
+        }
+        return resolveTelephony(callingPackage, key, realValue);
+    }
+
+    /**
+     * True when {@code value} has the shape of a MEID: 14 hexadecimal characters with at least
+     * one non-decimal digit. A 14-character all-decimal value is ambiguous, so it is treated as
+     * an IMEI - which is what it is on every GSM/LTE/NR device.
+     */
+    private static boolean isMeidShaped(String value) {
+        if (value == null || value.length() != 14) {
+            return false;
+        }
+        boolean allDecimal = true;
+        for (int i = 0; i < 14; i++) {
+            char c = value.charAt(i);
+            boolean decimal = c >= '0' && c <= '9';
+            boolean hex = decimal || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+            if (!hex) {
+                return false;
+            }
+            if (!decimal) {
+                allDecimal = false;
+            }
+        }
+        return !allDecimal;
+    }
+
+    /**
+     * Shape gate for a substituted MEID: 14 hexadecimal characters, or the empty string for the
+     * explicit "Empty" rule. Anything else is malformed, so the real value is returned - a bad
+     * rule must never hand an app a value its parser chokes on.
+     */
+    private static String sanitizeMeid(String substitute, String realValue) {
+        if (substitute == null) {
+            return realValue;
+        }
+        if (substitute.isEmpty() || substitute.equals(realValue)) {
+            return substitute;
+        }
+        if (substitute.length() != 14) {
+            return realValue;
+        }
+        for (int i = 0; i < 14; i++) {
+            char c = substitute.charAt(i);
+            boolean hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')
+                    || (c >= 'A' && c <= 'F');
+            if (!hex) {
+                return realValue;
+            }
+        }
+        return substitute;
+    }
+
+    /**
+     * Shape gate for a substituted phone number: E.164-ish, i.e. an optional leading "+" followed
+     * by 4 to 15 decimal digits. The empty string is the explicit "Empty" rule and is passed
+     * through untouched. Anything else is malformed, so the real value is returned - dialers, SMS
+     * apps and carrier apps parse this string, so a bad rule must never reach them.
+     */
+    private static String sanitizePhoneNumber(String substitute, String realValue) {
+        if (substitute == null) {
+            return realValue;
+        }
+        if (substitute.isEmpty() || substitute.equals(realValue)) {
+            return substitute;
+        }
+        String digits = substitute.startsWith("+") ? substitute.substring(1) : substitute;
+        return isDecimal(digits, 4, 15) ? substitute : realValue;
+    }
+
+    /**
+     * Shape gate for a substituted IMEI: 14 to 16 decimal digits (15 in
+     * practice; 14 is an IMEI without its check digit and 16 an IMEISV). The
+     * empty string is the explicit "Empty" rule and is passed through untouched.
+     * Anything else is malformed, so the real value is returned - the same
+     * contract SubscriptionManagerService applies to the SIM identity fields it
+     * substitutes, and for the same reason: apps parse these strings, so a bad
+     * rule must never reach them.
+     */
+    private static String sanitizeImei(String substitute, String realValue) {
+        if (substitute == null) {
+            return realValue;
+        }
+        if (substitute.isEmpty() || substitute.equals(realValue)) {
+            return substitute;
+        }
+        return isDecimal(substitute, 14, 16) ? substitute : realValue;
+    }
+
+    /**
+     * Shape gate for a substituted IMSI: 6 to 15 decimal digits (15 in practice - 3-digit MCC,
+     * 2 or 3 digit MNC, then the MSIN; 15 is the ITU E.212 maximum). The empty string is the
+     * explicit "Empty" rule and is passed through untouched. Carrier and SIM-aware apps slice
+     * this string by index, so a substitute that is not all digits or is over-length must never
+     * reach them.
+     */
+    private static String sanitizeImsi(String substitute, String realValue) {
+        if (substitute == null) {
+            return realValue;
+        }
+        if (substitute.isEmpty() || substitute.equals(realValue)) {
+            return substitute;
+        }
+        return isDecimal(substitute, 6, 15) ? substitute : realValue;
+    }
+
+    /**
+     * Shape gate for a substituted ICCID: 6 to 22 decimal digits (19-20 in
+     * practice). Mirrors SubscriptionManagerService sanitizeIccid, which gates
+     * the same value on the SubscriptionInfo path - both have to be gated or the
+     * malformed one is simply read through the other API.
+     */
+    private static String sanitizeIccid(String substitute, String realValue) {
+        if (substitute == null) {
+            return realValue;
+        }
+        if (substitute.isEmpty() || substitute.equals(realValue)) {
+            return substitute;
+        }
+        return isDecimal(substitute, 6, 22) ? substitute : realValue;
+    }
+
+    /** @return {@code true} if {@code value} is minLength..maxLength ASCII digits. */
+    private static boolean isDecimal(String value, int minLength, int maxLength) {
+        if (value == null || value.length() < minLength || value.length() > maxLength) {
+            return false;
+        }
+        for (int i = 0; i < value.length(); i++) {
+            char c = value.charAt(i);
+            // ASCII 48..57 only. Character.isDigit() would also accept
+            // Arabic-Indic digits, which no telephony parser on the device
+            // handles.
+            if (c < 48 || c > 57) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     @Deprecated
     public String getDeviceId(String callingPackage) {
         return getDeviceIdWithFeature(callingPackage, null);
@@ -124,8 +405,23 @@ public class PhoneSubInfoController extends IPhoneSubInfo.Stub {
     public String getDeviceIdForPhone(int phoneId, String callingPackage,
             String callingFeatureId) {
         enforceCallingPackageUidMatched(callingPackage);
+        // Captured here, at the binder entry point: the helper below clears the calling identity
+        // before it runs the lambda, so the uid has to be read now.
+        final int callingUid = Binder.getCallingUid();
         return callPhoneMethodForPhoneIdWithReadDeviceIdentifiersCheck(phoneId, callingPackage,
-                callingFeatureId, "getDeviceId", (phone) -> phone.getDeviceId());
+                callingFeatureId, "getDeviceId", (phone) -> {
+                    final String real = phone.getDeviceId();
+                    // Phone#getDeviceId() is the IMEI on a GSM/LTE/NR phone and the MEID on a
+                    // CDMA-capable one, so the value shape - 15 decimal digits vs 14 hex
+                    // characters - picks the key. Without this split a MEID would silently
+                    // borrow the imei rule and be rewritten into an IMEI-shaped value.
+                    if (isMeidShaped(real)) {
+                        return sanitizeMeid(resolveTelephonyForApp(callingUid, callingPackage,
+                                PrivacyKitKeys.KEY_MEID, real), real);
+                    }
+                    return sanitizeImei(resolveTelephonyForApp(callingUid, callingPackage,
+                            PrivacyKitKeys.KEY_IMEI, real), real);
+                });
     }
 
     public String getNaiForSubscriber(int subId, String callingPackage, String callingFeatureId) {
@@ -141,8 +437,15 @@ public class PhoneSubInfoController extends IPhoneSubInfo.Stub {
 
     public String getImeiForSubscriber(int subId, String callingPackage,
             String callingFeatureId) {
+        // Captured at the binder entry point: the callPhoneMethodFor* helper clears the calling
+        // identity before it runs the lambda, so the uid has to be read now.
+        final int callingUid = Binder.getCallingUid();
         return callPhoneMethodForSubIdWithReadDeviceIdentifiersCheck(subId, callingPackage,
-                callingFeatureId, "getImei", (phone) -> phone.getImei());
+                callingFeatureId, "getImei", (phone) -> {
+                    final String real = phone.getImei();
+                    return sanitizeImei(resolveTelephonyForApp(callingUid, callingPackage,
+                            PrivacyKitKeys.KEY_IMEI, real), real);
+                });
     }
 
     public ImsiEncryptionInfo getCarrierInfoForImsiEncryption(int subId, int keyType,
@@ -208,10 +511,22 @@ public class PhoneSubInfoController extends IPhoneSubInfo.Stub {
                 callingFeatureId);
     }
 
+    /**
+     * COHERENCE: {@code imsi}, {@code sim_operator}, {@code sim_operator_name} and
+     * {@code sim_country_iso} all describe ONE carrier and are meant to be minted together by a
+     * single Region Preset - one carrier record driving the MCC+MNC, the service provider name,
+     * the ISO country and the IMSI prefix (the IMSI opens with the same MCC+MNC as the operator
+     * numeric). Substituting only the IMSI yields a SIM whose subscriber id contradicts its own
+     * operator numeric, which is a stronger fingerprint than the real value. The preset is the UI
+     * contract; this hook deliberately substitutes only what it was asked for.
+     */
     public String getSubscriberIdForSubscriber(int subId, String callingPackage,
             String callingFeatureId) {
         String message = "getSubscriberIdForSubscriber";
-        mAppOps.checkPackage(Binder.getCallingUid(), callingPackage);
+        // Captured before any Binder.clearCallingIdentity() below, so the PrivacyKit
+        // system-caller guard sees the app uid and not the phone process.
+        final int callingUid = Binder.getCallingUid();
+        mAppOps.checkPackage(callingUid, callingPackage);
 
         long identity = Binder.clearCallingIdentity();
         boolean isActive;
@@ -228,7 +543,9 @@ public class PhoneSubInfoController extends IPhoneSubInfo.Stub {
                                 PackageManager.FEATURE_TELEPHONY_SUBSCRIPTION,
                                 "getSubscriberIdForSubscriber");
 
-                        return phone.getSubscriberId();
+                        final String real = phone.getSubscriberId();
+                        return sanitizeImsi(resolveTelephonyForApp(callingUid,
+                                callingPackage, PrivacyKitKeys.KEY_IMSI, real), real);
                     });
         } else {
             if (!TelephonyPermissions.checkCallingOrSelfReadSubscriberIdentifiers(
@@ -244,7 +561,9 @@ public class PhoneSubInfoController extends IPhoneSubInfo.Stub {
                 SubscriptionInfoInternal subInfo = SubscriptionManagerService.getInstance()
                         .getSubscriptionInfoInternal(subId);
                 if (subInfo != null && !TextUtils.isEmpty(subInfo.getImsi())) {
-                    return subInfo.getImsi();
+                    final String real = subInfo.getImsi();
+                    return sanitizeImsi(resolveTelephonyForApp(callingUid, callingPackage,
+                            PrivacyKitKeys.KEY_IMSI, real), real);
                 }
                 return null;
             } finally {
@@ -268,13 +587,17 @@ public class PhoneSubInfoController extends IPhoneSubInfo.Stub {
 
     public String getIccSerialNumberForSubscriber(int subId, String callingPackage,
             String callingFeatureId) {
+        // Captured at the binder entry point, before the helper clears the calling identity.
+        final int callingUid = Binder.getCallingUid();
         return callPhoneMethodForSubIdWithReadSubscriberIdentifiersCheck(subId, callingPackage,
                 callingFeatureId, "getIccSerialNumber", (phone) -> {
                     enforceTelephonyFeatureWithException(callingPackage,
                             PackageManager.FEATURE_TELEPHONY_SUBSCRIPTION,
                             "getIccSerialNumberForSubscriber");
 
-                    return phone.getIccSerialNumber();
+                    final String real = phone.getIccSerialNumber();
+                    return sanitizeIccid(resolveTelephonyForApp(callingUid, callingPackage,
+                            PrivacyKitKeys.KEY_ICCID, real), real);
                 });
     }
 
@@ -287,6 +610,12 @@ public class PhoneSubInfoController extends IPhoneSubInfo.Stub {
     // Prior to R, it also included READ_PHONE_STATE.  Maintain that for compatibility.
     public String getLine1NumberForSubscriber(int subId, String callingPackage,
             String callingFeatureId) {
+        // PrivacyKit-Native: this is the LEGACY phone-number path
+        // (TelephonyManager#getLine1Number). Modern callers read the same fact through
+        // SubscriptionManager#getPhoneNumber, served by SubscriptionManagerService, which
+        // resolves the same phone_number key. Both have to be wired or the substitution is
+        // bypassed by one binder call.
+        final int callingUid = Binder.getCallingUid();
         return callPhoneMethodForSubIdWithReadPhoneNumberCheck(
                 subId, callingPackage, callingFeatureId, "getLine1Number",
                 (phone)-> {
@@ -294,7 +623,9 @@ public class PhoneSubInfoController extends IPhoneSubInfo.Stub {
                             PackageManager.FEATURE_TELEPHONY_SUBSCRIPTION,
                             "getLine1NumberForSubscriber");
 
-                    return phone.getLine1Number();
+                    final String real = phone.getLine1Number();
+                    return sanitizePhoneNumber(resolveTelephonyForApp(callingUid, callingPackage,
+                            PrivacyKitKeys.KEY_PHONE_NUMBER, real), real);
                 });
     }
 
@@ -317,8 +648,16 @@ public class PhoneSubInfoController extends IPhoneSubInfo.Stub {
     // Prior to R it needed READ_PHONE_STATE.  Maintain that for compatibility.
     public String getMsisdnForSubscriber(int subId, String callingPackage,
             String callingFeatureId) {
+        // PrivacyKit-Native: the MSISDN is the subscriber number the SIM publishes in EF_MSISDN,
+        // i.e. the very value getLine1Number() usually returns. Left unhooked it would hand back
+        // the real number one binder call away from the substituted one.
+        final int callingUid = Binder.getCallingUid();
         return callPhoneMethodForSubIdWithReadPhoneNumberCheck(
-                subId, callingPackage, callingFeatureId, "getMsisdn", (phone)-> phone.getMsisdn());
+                subId, callingPackage, callingFeatureId, "getMsisdn", (phone)-> {
+                    final String real = phone.getMsisdn();
+                    return sanitizePhoneNumber(resolveTelephonyForApp(callingUid, callingPackage,
+                            PrivacyKitKeys.KEY_PHONE_NUMBER, real), real);
+                });
     }
 
     public String getVoiceMailNumber(String callingPackage, String callingFeatureId) {
